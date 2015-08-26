@@ -22,6 +22,7 @@ import (
 type Game struct {
 	sync.Mutex
 
+	ID      string
 	Players []*GamePlayer
 
 	HasBeenSetup bool
@@ -36,6 +37,9 @@ type Game struct {
 	kettleWrite chan []byte
 	clients     []*GameClient
 	history     []*game.PowerHistoryData
+
+	currentPlayer int
+	lastOptionID  int
 }
 
 type GamePlayer struct {
@@ -75,7 +79,9 @@ func (g *Game) Close() {
 	for _, c := range g.clients {
 		c.Disconnect()
 	}
-	g.kettleConn.Close()
+	if g.kettleConn != nil {
+		g.kettleConn.Close()
+	}
 	g.Lock()
 	defer g.Unlock()
 	select {
@@ -148,6 +154,7 @@ func (g *Game) Run() {
 		"forwardToClient": true,
 	})
 
+	g.ID = "testing"
 	g.history = append(g.history, &game.PowerHistoryData{
 		CreateGame: &game.PowerHistoryCreateGame{},
 	})
@@ -178,6 +185,8 @@ func (g *Game) Run() {
 		packets := []KettlePacket{}
 		json.Unmarshal(packetBuf, &packets)
 		createGame := g.history[0].CreateGame
+		deferredPackets := []*Packet{}
+		deferredHists := []*game.PowerHistoryData{}
 		for _, packet := range packets {
 			switch packet.Type {
 			case "GameEntity":
@@ -198,21 +207,25 @@ func (g *Game) Run() {
 					}
 				} else {
 					player.GameAccountId = &shared.BnetId{
-						Hi: proto.Uint64(1234),
-						Lo: proto.Uint64(5678),
+						Hi: proto.Uint64(0),
+						Lo: proto.Uint64(0),
 					}
 				}
 				createGame.Players = append(createGame.Players, player)
 			case "TagChange":
 				log.Printf("got a %s!\n", packet.Type)
+				if packet.TagChange.Tag == 23 && packet.TagChange.Value == 1 {
+					g.currentPlayer = packet.TagChange.EntityID - 1
+				}
 				tagChange := &game.PowerHistoryTagChange{}
 				tag := MakeTag(packet.TagChange.Tag, packet.TagChange.Value)
 				tagChange.Tag = tag.Name
 				tagChange.Value = tag.Value
 				tagChange.Entity = proto.Int32(int32(packet.TagChange.EntityID))
-				g.history = append(g.history, &game.PowerHistoryData{
+				hist := &game.PowerHistoryData{
 					TagChange: tagChange,
-				})
+				}
+				g.history = append(g.history, hist)
 			case "ActionStart":
 				log.Printf("got a %s!\n", packet.Type)
 			case "FullEntity":
@@ -246,16 +259,34 @@ func (g *Game) Run() {
 			case "Options":
 				log.Printf("got a %s!\n", packet.Type)
 				options := &game.AllOptions{}
-				options.Id = proto.Int32(1)
+				options.Id = proto.Int32(int32(g.lastOptionID))
+				g.lastOptionID++
 				for _, o := range packet.Options {
 					options.Options = append(options.Options, o.ToProto())
 				}
-				for _, c := range g.clients {
-					c.packetQueue <- EncodePacket(game.AllOptions_ID, options)
+				if g.currentPlayer == 2 {
+					endTurn := &KettlePacket{
+						Type:   "SendOption",
+						GameID: g.ID,
+						SendOption: &KettleSendOption{
+							Index:     0,
+							Target:    0,
+							SubOption: -1,
+							Position:  0,
+						},
+					}
+					endTurnBuf, _ := json.Marshal(endTurn)
+					g.kettleWrite <- endTurnBuf
+				} else {
+					deferredPackets = append(deferredPackets,
+						EncodePacket(game.AllOptions_ID, options))
 				}
 			default:
 				log.Panicf("unknown Kettle packet type: %s", packet.Type)
 			}
+		}
+		for _, hist := range deferredHists {
+			g.history = append(g.history, hist)
 		}
 		g.HasBeenSetup = true
 		for _, c := range g.clients {
@@ -264,6 +295,9 @@ func (g *Game) Run() {
 					List: g.history[c.hasHistoryTo:],
 				})
 				c.hasHistoryTo = len(g.history)
+			}
+			for _, p := range deferredPackets {
+				c.packetQueue <- p
 			}
 		}
 	}
@@ -274,9 +308,9 @@ func (g *Game) InitKettle() {
 	for _, player := range g.Players {
 		playerCards := []string{}
 		for _, card := range player.Deck.Cards {
-			//for i := 0; i < card.Num; i++ {
-			playerCards = append(playerCards, cardAssetIdToMiniGuid[card.CardID])
-			//}
+			for i := 0; i < int(card.Num); i++ {
+				playerCards = append(playerCards, cardAssetIdToMiniGuid[card.CardID])
+			}
 		}
 		init.Players = append(init.Players, KettleCreatePlayer{
 			Hero:  player.Hero.NoteMiniGuid,
@@ -286,7 +320,7 @@ func (g *Game) InitKettle() {
 	}
 	initBuf, err := json.Marshal([]KettlePacket{{
 		Type:       "CreateGame",
-		GameID:     "testing",
+		GameID:     g.ID,
 		CreateGame: &init,
 	}})
 	if err != nil {
@@ -327,6 +361,7 @@ type KettlePacket struct {
 	MetaData    *KettleMetaData    `json:",omitempty"`
 	Choices     *KettleChoices     `json:",omitempty"`
 	Options     []*KettleOption    `json:",omitempty"`
+	SendOption  *KettleSendOption  `json:",omitempty"`
 }
 
 type KettleCreateGame struct {
@@ -425,6 +460,13 @@ type KettleSubOption struct {
 	Targets []int `json:",omitempty"`
 }
 
+type KettleSendOption struct {
+	Index     int
+	Target    int
+	SubOption int
+	Position  int
+}
+
 func (o *KettleOption) ToProto() *game.Option {
 	res := &game.Option{}
 	var x = game.Option_Type(o.Type)
@@ -470,7 +512,7 @@ func (g *Game) Listen() {
 		c := &GameClient{}
 		c.g = g
 		c.conn = conn
-		c.packetQueue = make(chan *Packet, 1)
+		c.packetQueue = make(chan *Packet, 16)
 		c.quit = make(chan struct{})
 		g.clients = append(g.clients, c)
 		go c.ReadPackets()
@@ -608,6 +650,21 @@ func (c *GameClient) OnChooseOption(body []byte) {
 	req := &game.ChooseOption{}
 	proto.Unmarshal(body, req)
 	log.Printf("ChooseOption = %s\n", req.String())
+	packet := &KettlePacket{
+		Type:   "SendOption",
+		GameID: c.g.ID,
+	}
+	packet.SendOption = &KettleSendOption{
+		Index:     int(*req.Index),
+		Target:    int(*req.Target),
+		SubOption: int(*req.SubOption),
+		Position:  int(*req.Position),
+	}
+	buf, err := json.Marshal(packet)
+	if err != nil {
+		panic(err)
+	}
+	c.g.kettleWrite <- buf
 }
 
 func (c *GameClient) OnUserUI(body []byte) {

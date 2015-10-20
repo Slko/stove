@@ -98,7 +98,7 @@ def main():
 
 	for path in files:
 		tablename = os.path.splitext(path)[0].lower()
-		with open(os.path.join(datadir, "DBF", path), "r", encoding="utf-8") as f:
+		with io.open(os.path.join(datadir, "DBF", path), "r", encoding="utf-8") as f:
 			xml = ElementTree.parse(f)
 
 			cols = [(e.attrib["name"], e.attrib["type"]) for e in xml.findall("Column")]

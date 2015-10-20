@@ -2,8 +2,7 @@
 import os
 import sqlite3
 import sys
-import io
-from xml.etree import ElementTree
+import xml.etree.cElementTree as etree
 
 
 def generate_columns(table, columns):
@@ -98,27 +97,27 @@ def main():
 
 	for path in files:
 		tablename = os.path.splitext(path)[0].lower()
-		with io.open(os.path.join(datadir, "DBF", path), "r", encoding="utf-8") as f:
-			xml = ElementTree.parse(f)
+		parser = etree.XMLParser(encoding="utf-8")
+		xml = etree.parse(os.path.join(datadir, "DBF", path), parser=parser)
 
-			cols = [(e.attrib["name"], e.attrib["type"]) for e in xml.findall("Column")]
+		cols = [(e.attrib["name"], e.attrib["type"]) for e in xml.findall("Column")]
 
-			_columns = generate_columns(tablename, cols)
-			create_tbl = "CREATE TABLE IF NOT EXISTS dbf_%s (%s)" % (tablename, _columns)
-			connection.execute(create_tbl)
+		_columns = generate_columns(tablename, cols)
+		create_tbl = "CREATE TABLE IF NOT EXISTS dbf_%s (%s)" % (tablename, _columns)
+		connection.execute(create_tbl)
 
-			values = []
-			for record in xml.findall("Record"):
-				fields = [get_field(tablename, record, column, type) for column, type in cols]
+		values = []
+		for record in xml.findall("Record"):
+			fields = [get_field(tablename, record, column, type) for column, type in cols]
 
-				values.append(fields)
+			values.append(fields)
 
-			values_ph = ", ".join("?" for c in cols)
-			insert_into = "INSERT INTO dbf_%s VALUES (%s)" % (tablename, values_ph)
+		values_ph = ", ".join("?" for c in cols)
+		insert_into = "INSERT INTO dbf_%s VALUES (%s)" % (tablename, values_ph)
 
-			print(insert_into)
+		print(insert_into)
 
-			connection.executemany(insert_into, values)
+		connection.executemany(insert_into, values)
 
 	# Add card names
 	connection.execute("ALTER TABLE dbf_card ADD COLUMN name_enus text")
@@ -142,31 +141,31 @@ def main():
 	cur.execute("SELECT id, note_mini_guid FROM dbf_card")
 	rows = cur.fetchall()
 
-	with io.open(os.path.join(datadir, "CardDefs.xml"), "r", encoding="utf-8") as f:
-		xml = ElementTree.parse(f)
+	parser = etree.XMLParser(encoding="utf-8")
+	xml = etree.parse(os.path.join(datadir, "CardDefs.xml"), parser=parser)
 
-		for pk, id in rows:
-			xpath = 'Entity[@CardID="%s"]' % (id)
-			e = xml.find(xpath)
-			if e is None:
-				print("WARNING: Could not find card %r in hs-data." % (id))
-				continue
-			name = e.find('Tag[@enumID="185"]/enUS').text
-			connection.execute("UPDATE dbf_card SET name_enus = ? WHERE id = ?", (name, pk))
-			card_set = get_tag(e, 183)
-			card_class = get_tag(e, 199)
-			rarity = get_tag(e, 203)
-			craft_cost, de_cost, gold_craft_cost, gold_de_cost = get_crafting_values(card_set, rarity)
-			vars = card_class, rarity, card_set, craft_cost, de_cost, gold_craft_cost, gold_de_cost, pk
-			connection.execute("""UPDATE dbf_card SET
-				class_id = ?,
-				rarity = ?,
-				card_set = ?,
-				buy_price = ?,
-				sell_price = ?,
-				gold_buy_price = ?,
-				gold_sell_price = ?
-			WHERE id = ?""", vars)
+	for pk, id in rows:
+		xpath = 'Entity[@CardID="%s"]' % (id)
+		e = xml.find(xpath)
+		if e is None:
+			print("WARNING: Could not find card %r in hs-data." % (id))
+			continue
+		name = e.find('Tag[@enumID="185"]/enUS').text
+		connection.execute("UPDATE dbf_card SET name_enus = ? WHERE id = ?", (name, pk))
+		card_set = get_tag(e, 183)
+		card_class = get_tag(e, 199)
+		rarity = get_tag(e, 203)
+		craft_cost, de_cost, gold_craft_cost, gold_de_cost = get_crafting_values(card_set, rarity)
+		vars = card_class, rarity, card_set, craft_cost, de_cost, gold_craft_cost, gold_de_cost, pk
+		connection.execute("""UPDATE dbf_card SET
+			class_id = ?,
+			rarity = ?,
+			card_set = ?,
+			buy_price = ?,
+			sell_price = ?,
+			gold_buy_price = ?,
+			gold_sell_price = ?
+		WHERE id = ?""", vars)
 
 	connection.commit()
 	connection.close()

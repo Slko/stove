@@ -2,7 +2,7 @@
 import os
 import sqlite3
 import sys
-import xml.etree.cElementTree as etree
+import xml.etree.ElementTree as etree
 
 
 def generate_columns(table, columns):
